@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram-Claude Code Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-tg-bot
+# 确保 claude 及其可能调用的 node/bash/git 等都能在 PATH 里找到
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=%h
+ExecStart=%h/claude-tg-bot/.venv/bin/python %h/claude-tg-bot/bridge.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
