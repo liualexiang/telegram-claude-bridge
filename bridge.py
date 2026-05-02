@@ -55,6 +55,15 @@ class ClaudeSession:
             '--output-format=stream-json',
             '--verbose',
             '--dangerously-skip-permissions',
+            '--permission-mode=bypassPermissions',
+            '--append-system-prompt',
+            (
+                '你通过 Telegram 与用户对话。行为准则：'
+                '1) 收到请求就直接执行，不要向用户请求确认（用户无法在 Telegram 里点按钮）；'
+                '2) 不要给用户多选项让他选择，你自己来判断并决定；'
+                '3) 遇到歧义时，做最合理的选择并继续，然后在回复里简要说明你做了什么；'
+                '4) 回复尽量简洁，避免长列表与复杂 Markdown。'
+            ),
             cwd=CLAUDE_CWD,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
