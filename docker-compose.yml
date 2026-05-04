@@ -1,0 +1,18 @@
+services:
+  claude-tg-bot:
+    build: .
+    image: claude-tg-bot:latest
+    container_name: claude-tg-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CLAUDE_BIN: /usr/local/bin/claude
+      CLAUDE_CWD: /workspace
+    volumes:
+      - ./workspace:/workspace
+      - claude-home:/root/.claude
+    stop_grace_period: 10s
+
+volumes:
+  claude-home:
