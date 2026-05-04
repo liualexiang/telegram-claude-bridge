@@ -2,6 +2,8 @@
 """Telegram -> Claude Code bridge with per-chat session isolation."""
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
@@ -10,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputFile, InputMediaPhoto, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
@@ -42,6 +44,7 @@ class ClaudeSession:
         self._result_text: Optional[str] = None
         self._result_error: Optional[str] = None
         self._assistant_buffer: list[str] = []
+        self._pending_images: list[bytes] = []
 
     async def ensure_started(self):
         if self.proc is None or self.proc.returncode is not None:
@@ -74,18 +77,45 @@ class ClaudeSession:
 
     async def _read_stdout(self):
         assert self.proc and self.proc.stdout
-        async for raw in self.proc.stdout:
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                log.warning('[chat=%s] non-JSON: %r', self.chat_id, raw[:200])
-                continue
-            await self._handle_event(event)
-        log.warning('[chat=%s] claude stdout ended (rc=%s)',
-                    self.chat_id, self.proc.returncode if self.proc else 'n/a')
-        if self._result_event is not None and not self._result_event.is_set():
-            self._result_error = 'Claude process exited unexpectedly.'
-            self._result_event.set()
+        buffer = bytearray()
+        reader_error = None
+        try:
+            while True:
+                chunk = await self.proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                while True:
+                    newline = buffer.find(b'\n')
+                    if newline == -1:
+                        break
+                    raw = bytes(buffer[:newline])
+                    del buffer[:newline + 1]
+                    if not raw.strip():
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        log.warning('[chat=%s] non-JSON: %r', self.chat_id, raw[:200])
+                        continue
+                    await self._handle_event(event)
+            if buffer.strip():
+                raw = bytes(buffer)
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    log.warning('[chat=%s] trailing non-JSON: %r', self.chat_id, raw[:200])
+                else:
+                    await self._handle_event(event)
+        except Exception as e:
+            reader_error = f'Claude output reader failed: {e}'
+            log.exception('[chat=%s] stdout reader crashed', self.chat_id)
+        finally:
+            log.warning('[chat=%s] claude stdout ended (rc=%s)',
+                        self.chat_id, self.proc.returncode if self.proc else 'n/a')
+            if self._result_event is not None and not self._result_event.is_set():
+                self._result_error = reader_error or 'Claude process exited unexpectedly.'
+                self._result_event.set()
 
     async def _read_stderr(self):
         assert self.proc and self.proc.stderr
@@ -105,6 +135,31 @@ class ClaudeSession:
                     text = block.get('text', '')
                     if text:
                         self._assistant_buffer.append(text)
+        elif t == 'user':
+            content = event.get('message', {}).get('content', []) or []
+            for block in content:
+                if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                    continue
+                tool_content = block.get('content', []) or []
+                if isinstance(tool_content, str):
+                    continue
+                if not isinstance(tool_content, list):
+                    continue
+                for item in tool_content:
+                    if isinstance(item, str):
+                        continue
+                    if not isinstance(item, dict) or item.get('type') != 'image':
+                        continue
+                    source = item.get('source', {}) or {}
+                    if source.get('type') != 'base64':
+                        continue
+                    data = source.get('data')
+                    if not data:
+                        continue
+                    try:
+                        self._pending_images.append(base64.b64decode(data))
+                    except Exception:
+                        log.exception('[chat=%s] failed to decode tool image', self.chat_id)
         elif t == 'result':
             sub = event.get('subtype', '')
             fallback = ''.join(self._assistant_buffer).strip()
@@ -121,7 +176,7 @@ class ClaudeSession:
             if self._result_event is not None:
                 self._result_event.set()
 
-    async def send(self, text: str) -> str:
+    async def send(self, text: str) -> tuple[str, list[bytes]]:
         await self.ensure_started()
         async with self.lock:
             self.last_active = time.time()
@@ -129,6 +184,7 @@ class ClaudeSession:
             self._result_text = None
             self._result_error = None
             self._assistant_buffer = []
+            self._pending_images = []
             msg = {'type': 'user', 'message': {'role': 'user', 'content': text}}
             assert self.proc and self.proc.stdin
             self.proc.stdin.write((json.dumps(msg, ensure_ascii=False) + '\n').encode('utf-8'))
@@ -136,7 +192,7 @@ class ClaudeSession:
             await self._result_event.wait()
             if self._result_error:
                 raise RuntimeError(self._result_error)
-            return self._result_text or ''
+            return self._result_text or '', list(self._pending_images)
 
     async def stop(self):
         if self.proc and self.proc.returncode is None:
@@ -220,6 +276,28 @@ async def cmd_newsession(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('done.')
 
 
+async def _send_images(update: Update, images: list[bytes]):
+    if not images:
+        return
+    try:
+        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+    except Exception:
+        pass
+    if len(images) == 1:
+        await update.message.reply_photo(
+            photo=InputFile(images[0], filename='screenshot-1.png')
+        )
+        return
+    media = []
+    for idx, data in enumerate(images[:10], 1):
+        media.append(
+            InputMediaPhoto(
+                media=InputFile(data, filename=f'screenshot-{idx}.png')
+            )
+        )
+    await update.message.reply_media_group(media=media)
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -231,14 +309,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.chat.send_action(ChatAction.TYPING)
     except Exception:
         pass
+    images: list[bytes] = []
     try:
         sess = await manager.get(chat_id)
-        reply = await sess.send(text)
+        reply, images = await sess.send(text)
     except Exception as e:
         log.exception('send failed')
         reply = f'error: {e}'
     if not reply:
         reply = '(no text in claude reply)'
+    await _send_images(update, images)
     for i in range(0, len(reply), 4000):
         await update.message.reply_text(reply[i:i + 4000])
 
