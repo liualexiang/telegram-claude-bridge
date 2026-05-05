@@ -45,6 +45,7 @@ class ClaudeSession:
         self._result_error: Optional[str] = None
         self._assistant_buffer: list[str] = []
         self._pending_images: list[bytes] = []
+        self._tool_names: dict[str, str] = {}
 
     async def ensure_started(self):
         if self.proc is None or self.proc.returncode is not None:
@@ -131,14 +132,23 @@ class ClaudeSession:
         elif t == 'assistant':
             content = event.get('message', {}).get('content', []) or []
             for block in content:
-                if block.get('type') == 'text':
+                btype = block.get('type')
+                if btype == 'text':
                     text = block.get('text', '')
                     if text:
                         self._assistant_buffer.append(text)
+                elif btype == 'tool_use':
+                    tid = block.get('id')
+                    tname = block.get('name', '')
+                    if tid:
+                        self._tool_names[tid] = tname
         elif t == 'user':
             content = event.get('message', {}).get('content', []) or []
             for block in content:
                 if not isinstance(block, dict) or block.get('type') != 'tool_result':
+                    continue
+                tool_name = self._tool_names.get(block.get('tool_use_id'), '')
+                if 'screenshot' not in tool_name.lower():
                     continue
                 tool_content = block.get('content', []) or []
                 if isinstance(tool_content, str):
@@ -176,7 +186,7 @@ class ClaudeSession:
             if self._result_event is not None:
                 self._result_event.set()
 
-    async def send(self, text: str) -> tuple[str, list[bytes]]:
+    async def send(self, content) -> tuple[str, list[bytes]]:
         await self.ensure_started()
         async with self.lock:
             self.last_active = time.time()
@@ -185,7 +195,8 @@ class ClaudeSession:
             self._result_error = None
             self._assistant_buffer = []
             self._pending_images = []
-            msg = {'type': 'user', 'message': {'role': 'user', 'content': text}}
+            self._tool_names = {}
+            msg = {'type': 'user', 'message': {'role': 'user', 'content': content}}
             assert self.proc and self.proc.stdin
             self.proc.stdin.write((json.dumps(msg, ensure_ascii=False) + '\n').encode('utf-8'))
             await self.proc.stdin.drain()
@@ -283,19 +294,38 @@ async def _send_images(update: Update, images: list[bytes]):
         await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
     except Exception:
         pass
-    if len(images) == 1:
-        await update.message.reply_photo(
-            photo=InputFile(images[0], filename='screenshot-1.png')
-        )
-        return
-    media = []
     for idx, data in enumerate(images[:10], 1):
-        media.append(
-            InputMediaPhoto(
-                media=InputFile(data, filename=f'screenshot-{idx}.png')
+        try:
+            await update.message.reply_photo(
+                photo=InputFile(data, filename=f'screenshot-{idx}.png')
             )
-        )
-    await update.message.reply_media_group(media=media)
+        except Exception:
+            log.exception('failed to send photo #%d', idx)
+
+
+async def _dispatch(update: Update, chat_id: int, content):
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+    except Exception:
+        pass
+    images: list[bytes] = []
+    try:
+        sess = await manager.get(chat_id)
+        reply, images = await sess.send(content)
+    except Exception as e:
+        log.exception('send failed')
+        reply = f'error: {e}'
+    if not reply:
+        reply = '(no text in claude reply)'
+    try:
+        await _send_images(update, images)
+    except Exception:
+        log.exception('_send_images crashed; continuing with text')
+    for i in range(0, len(reply), 4000):
+        try:
+            await update.message.reply_text(reply[i:i + 4000])
+        except Exception:
+            log.exception('failed to send text chunk starting at %d', i)
 
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -304,23 +334,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or '').strip()
     if not text:
         return
+    await _dispatch(update, update.effective_chat.id, text)
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    msg = update.message
+    if not msg or not msg.photo:
+        return
     chat_id = update.effective_chat.id
+    photo = msg.photo[-1]
     try:
-        await update.message.chat.send_action(ChatAction.TYPING)
-    except Exception:
-        pass
-    images: list[bytes] = []
-    try:
-        sess = await manager.get(chat_id)
-        reply, images = await sess.send(text)
+        tg_file = await photo.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
-        log.exception('send failed')
-        reply = f'error: {e}'
-    if not reply:
-        reply = '(no text in claude reply)'
-    await _send_images(update, images)
-    for i in range(0, len(reply), 4000):
-        await update.message.reply_text(reply[i:i + 4000])
+        log.exception('[chat=%s] failed to download photo', chat_id)
+        await msg.reply_text(f'error downloading photo: {e}')
+        return
+    log.info('[chat=%s] got photo (%d bytes)', chat_id, len(raw))
+    caption = (msg.caption or '').strip()
+    content = [
+        {
+            'type': 'image',
+            'source': {
+                'type': 'base64',
+                'media_type': 'image/jpeg',
+                'data': base64.b64encode(raw).decode(),
+            },
+        },
+        {'type': 'text', 'text': caption or '看一下这张图。'},
+    ]
+    await _dispatch(update, chat_id, content)
 
 
 async def post_init(app: Application):
@@ -332,6 +377,7 @@ def main():
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('newsession', cmd_newsession))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     log.info('polling...')
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
